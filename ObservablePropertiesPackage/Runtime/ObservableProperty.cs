@@ -9,13 +9,20 @@ using UnityEngine.Events;
 /// </summary>
 public abstract class ObservableBase
 {
-    private int _isEnqueued; // 0 = not enqueued, 1 = enqueued
+    private int _isEnqueued;     // 0 = not enqueued, 1 = enqueued
+    private int _isDispatching;  // 0 = idle, 1 = dispatching (reentrancy guard)
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal bool TryMarkEnqueued() => Interlocked.Exchange(ref _isEnqueued, 1) == 0;
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal void ClearEnqueued() => Volatile.Write(ref _isEnqueued, 0);
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal bool TryBeginDispatch() => Interlocked.Exchange(ref _isDispatching, 1) == 0;
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal void EndDispatch() => Volatile.Write(ref _isDispatching, 0);
 
     internal abstract void DispatchNotifications();
 }
@@ -301,47 +308,58 @@ public class ObservableProperty<T> : ObservableBase, IObservable<T>, IDisposable
     {
         ClearEnqueued();
 
-        T currentValue;
-        SubscriberEntry[] currentSubs;
-        int count;
+        // System-level reentrancy guard: prevents recursive subscriber feedback loops
+        if (!TryBeginDispatch())
+            return;
 
-        lock (_lock)
+        try
         {
-            currentValue = value;
-            currentSubs = _subscribers;
-            count = _subscriberCount;
-        }
+            T currentValue;
+            SubscriberEntry[] currentSubs;
+            int count;
 
-        // Direct index iteration without IEnumerator allocations
-        for (int i = 0; i < count; i++)
-        {
-            var entry = currentSubs[i];
-            if (entry.Observer == null) continue;
-
-            if (entry.Observer is UnityEngine.Object unityObj && unityObj == null)
+            lock (_lock)
             {
-                Unsubscribe(entry.Observer);
-                continue;
+                currentValue = value;
+                currentSubs = _subscribers;
+                count = _subscriberCount;
+            }
+
+            // Direct index iteration without IEnumerator allocations
+            for (int i = 0; i < count; i++)
+            {
+                var entry = currentSubs[i];
+                if (entry.Observer == null) continue;
+
+                if (entry.Observer is UnityEngine.Object unityObj && unityObj == null)
+                {
+                    Unsubscribe(entry.Observer);
+                    continue;
+                }
+
+                try
+                {
+                    entry.Callback?.Invoke(currentValue);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogException(e);
+                    Unsubscribe(entry.Observer);
+                }
             }
 
             try
             {
-                entry.Callback?.Invoke(currentValue);
+                _unityEventCallbacks?.Invoke(currentValue);
             }
             catch (Exception e)
             {
                 Debug.LogException(e);
-                Unsubscribe(entry.Observer);
             }
         }
-
-        try
+        finally
         {
-            _unityEventCallbacks?.Invoke(currentValue);
-        }
-        catch (Exception e)
-        {
-            Debug.LogException(e);
+            EndDispatch();
         }
     }
 

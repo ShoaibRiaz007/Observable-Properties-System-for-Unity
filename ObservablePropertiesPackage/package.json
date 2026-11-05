@@ -1,0 +1,30 @@
+{
+  "name": "com.shoaibriaz.observable-properties",
+  "version": "1.0.0",
+  "displayName": "Thread-Safe Zero-GC Observable Properties System",
+  "description": "High-performance, thread-safe, 0 B GC.Alloc observable properties and centralized state notification system for Unity.",
+  "unity": "2020.3",
+  "unityRelease": "0f1",
+  "documentationUrl": "https://github.com/ShoaibRiaz007/Observable-Properties-System-for-Unity#readme",
+  "changelogUrl": "https://github.com/ShoaibRiaz007/Observable-Properties-System-for-Unity/releases",
+  "licensesUrl": "https://github.com/ShoaibRiaz007/Observable-Properties-System-for-Unity/blob/main/LICENSE",
+  "keywords": [
+    "observable",
+    "reactive",
+    "thread-safe",
+    "zero-gc",
+    "state-management",
+    "event-system"
+  ],
+  "author": {
+    "name": "Shoaib Riaz",
+    "url": "https://shoaibriaz.com"
+  },
+  "samples": [
+    {
+      "displayName": "Stress Test Benchmark",
+      "description": "Validates multi-threaded performance, frame batching, and 0 B GC.Alloc in the Unity Profiler.",
+      "path": "Samples~/StressTest"
+    }
+  ]
+}
