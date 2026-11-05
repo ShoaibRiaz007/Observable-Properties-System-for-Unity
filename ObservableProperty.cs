@@ -1,284 +1,348 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Linq;
+using System.Threading;
 using UnityEngine;
 using UnityEngine.Events;
 
 /// <summary>
-/// Base interface for all observable objects
+/// Non-generic base class enabling zero-allocation enqueuing and state coalescing.
+/// </summary>
+public abstract class ObservableBase
+{
+    private int _isEnqueued; // 0 = not enqueued, 1 = enqueued
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal bool TryMarkEnqueued() => Interlocked.Exchange(ref _isEnqueued, 1) == 0;
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal void ClearEnqueued() => Volatile.Write(ref _isEnqueued, 0);
+
+    internal abstract void DispatchNotifications();
+}
+
+/// <summary>
+/// Base interface for all observable objects.
 /// </summary>
 /// <typeparam name="T">Generic type</typeparam>
-interface IObservable<T>
+public interface IObservable<T>
 {
     /// <summary>
-    /// Set/Get the value of the observable property
+    /// Set/Get the value of the observable property (Thread-safe).
     /// </summary>
-    /// <remarks>
-    /// <para>
-    /// This is thread safe
-    /// </para>
-    /// <para>
-    /// This will not notify subscribers if the new value is the same as the current value
-    /// </para>
-    ///  Subscriber will be notified in batch update
-    /// </remarks>
-    /// <param name="Value">The new value to set</param>
     T Value { get; set; }
+
     /// <summary>
-    /// Subscribe to the observable property
+    /// Subscribe to value changes using an observer identity.
+    /// Thread-safe. Replaces any existing subscription for the same observer.
     /// </summary>
-    /// <remarks>
-    /// This is thread safe
-    /// <para>
-    /// This will not throw an exception if the observer is already subscribed
-    /// </para>
-    /// <para>
-    /// This will throw an exception if the observer is null
-    /// </para>
-    /// This will throw an exception if the callback is null
-    /// </remarks>
-    /// <param name="observer">The observer to subscribe to</param>
-    /// <param name="callback">The callback to invoke when the value changes</param>
     void Subscribe(object observer, Action<T> callback);
+
     /// <summary>
-    /// Subscribe to the observable property.
+    /// Subscribe using an Action callback, returning a disposable subscription handle.
     /// </summary>
-    /// <remarks>
-    /// This will not throw an exception if the observer is already subscribed.
-    /// <para>
-    /// This will throw an exception if the callback is null
-    /// </para>
-    /// <para>
-    /// This is low level and should be used sparingly. It will impact performance.
-    /// </para>
-    /// </remarks>
-    /// <param name="callback">The callback to invoke when the value changes</param>
+    IDisposable Subscribe(Action<T> callback);
+
+    /// <summary>
+    /// Subscribe using a UnityAction callback.
+    /// </summary>
     void Subscribe(UnityAction<T> callback);
+
     /// <summary>
-    /// Unsubscribe from the observable property
+    /// Unsubscribe an observer identity.
     /// </summary>
-    /// <param name="observer"></param>
     void Unsubscribe(object observer);
+
     /// <summary>
-    /// Set the value of the observable property
+    /// Unsubscribe a UnityAction callback.
     /// </summary>
-    /// <remarks>
-    /// <para>
-    /// This is thread safe
-    /// </para>
-    /// <para>
-    /// This will not notify subscribers if the new value is the same as the current value
-    /// </para>
-    /// </remarks>
+    void Unsubscribe(UnityAction<T> callback);
+
+    /// <summary>
+    /// Set value with optional immediate notification.
+    /// </summary>
     /// <param name="newValue">The new value to set</param>
-    /// <param name="forceUpdate">
-    /// If true, the value will be updated and subscribers will be notified on same frame 
-    /// <para>This is not recommended for large numbers of subscribers</para>
-    /// <para>If false values will be batched and notified by batch update</para>
-    /// </param>
+    /// <param name="forceUpdate">If true and on main thread, updates synchronously without queueing</param>
     void SetValue(T newValue, bool forceUpdate = false);
 }
+
 /// <summary>
-/// Central notification system for all observable properties.
-/// This is a singleton and will be destroyed when the scene is unloaded.
-/// This is thread-safe.
+/// Central notification system supporting Action delegates and lambdas.
+/// Uses pre-allocated circular ring buffers to guarantee 0 B GC.Alloc when running cached delegates.
 /// </summary>
 public class CentralNotificationSystem : MonoBehaviour
 {
-    private const int MaxJobHandles = 10000;
-    private const int InitialBatchSize = 500;
-    public static CentralNotificationSystem Instance { get; private set; }
+    private const int BufferCapacity = 16384;
+    private const int BufferMask = BufferCapacity - 1;
+    private const int MaxBatchPerFrame = 4096;
 
-    [RuntimeInitializeOnLoadMethod]
+    public static CentralNotificationSystem Instance { get; private set; }
+    private static int _mainThreadId;
+
+    // Pre-allocated Action arrays for zero-GC queue operations
+    private readonly Action[] _normalRing = new Action[BufferCapacity];
+    private readonly Action[] _highRing = new Action[BufferCapacity];
+
+    private int _normalHead;
+    private int _normalTail;
+    private readonly object _normalLock = new();
+
+    private int _highHead;
+    private int _highTail;
+    private readonly object _highLock = new();
+
+    public static bool IsMainThread => Thread.CurrentThread.ManagedThreadId == _mainThreadId;
+
+    [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     private static void LazyInstance()
     {
+        _mainThreadId = Thread.CurrentThread.ManagedThreadId;
         if (Instance == null)
         {
-            var temp = new GameObject("NotificationSystem");
+            var temp = new GameObject("[CentralNotificationSystem]");
             Instance = temp.AddComponent<CentralNotificationSystem>();
             DontDestroyOnLoad(temp);
         }
     }
 
-    private class PriorityQueue<TKey, TValue> where TKey : IComparable<TKey>
-    {
-        private readonly SortedDictionary<TKey, Queue<TValue>> sortedDict = new();
-
-        public bool IsEmpty => sortedDict.Count == 0;
-        public int Count { get; private set; }
-
-        public void Enqueue(TKey key, TValue value)
-        {
-            if (!sortedDict.TryGetValue(key, out var queue))
-            {
-                queue = new Queue<TValue>();
-                sortedDict[key] = queue;
-            }
-            queue.Enqueue(value);
-            Count++;
-        }
-
-        public TValue Dequeue()
-        {
-            if (IsEmpty) throw new InvalidOperationException("Queue is empty.");
-
-            var firstPair = sortedDict.First();
-            var value = firstPair.Value.Dequeue();
-
-            if (firstPair.Value.Count == 0)
-                sortedDict.Remove(firstPair.Key);
-            Count--;
-            if (IsEmpty)
-                Count = 0;
-            return value;
-        }
-
-        public void Clear()
-        {
-            sortedDict.Clear();
-            Count = 0;
-        }
-    }
-
-#if UNITY_EDITOR
-    [field: SerializeField] int _ActiveJobs;
-#endif
-    private readonly PriorityQueue<int, Action> actionQueue = new();
-    [field: SerializeField] private int currentBatchSize = InitialBatchSize;
-
     private void Awake()
     {
-        Application.lowMemory += OnLowMemory;
+        _mainThreadId = Thread.CurrentThread.ManagedThreadId;
+        if (Instance != null && Instance != this)
+        {
+            Destroy(gameObject);
+            return;
+        }
+        Instance = this;
+        DontDestroyOnLoad(gameObject);
     }
 
-    private void OnLowMemory()
+    /// <summary>
+    /// Enqueue an Action or lambda to execute on the Unity main thread.
+    /// When passing a cached delegate (e.g. from ObservableProperty), this allocates exactly 0 B heap memory.
+    /// </summary>
+    /// <param name="action">Action callback to execute</param>
+    /// <param name="priority">Priority level (>= 100 for high priority, 0 for normal)</param>
+    public void EnqueueMainThreadAction(Action action, int priority = 0)
     {
-        Debug.LogWarning("Low memory detected. Cleaning up unused resources.");
-        GC.Collect();
-        ReduceBatchSize();
+        if (action == null) return;
+
+        if (priority >= 100)
+        {
+            lock (_highLock)
+            {
+                _highRing[_highTail & BufferMask] = action;
+                _highTail++;
+            }
+        }
+        else
+        {
+            lock (_normalLock)
+            {
+                _normalRing[_normalTail & BufferMask] = action;
+                _normalTail++;
+            }
+        }
     }
 
     private void LateUpdate()
     {
-#if UNITY_EDITOR
-        _ActiveJobs = actionQueue.Count;
-#endif
-        if (actionQueue.Count == 0)
-            return;
-        AdjustBatchSize();
-        ScheduleActions();
-    }
-    private void AdjustBatchSize()
-    {
-        if (actionQueue.Count > MaxJobHandles)
-        {
-            currentBatchSize = actionQueue.Count;
-        }
-        else
-        {
-            currentBatchSize = Math.Max(currentBatchSize - 50, InitialBatchSize);
-        }
-    }
-    public void EnqueueMainThreadAction(Action action, int priority = 0)
-    {
-        if (action == null) throw new ArgumentNullException(nameof(action));
-        actionQueue.Enqueue(priority, action);
-    }
-
-    private void ScheduleActions()
-    {
-        if (actionQueue.IsEmpty ) return;
-
         int processedCount = 0;
 
-        try
+        // Drain high-priority actions first
+        while (processedCount < MaxBatchPerFrame)
         {
-            while (!actionQueue.IsEmpty && processedCount < currentBatchSize)
+            Action action = null;
+            lock (_highLock)
             {
-                var action = actionQueue.Dequeue();
-
-                action?.Invoke();
-                processedCount++;
+                if (_highHead != _highTail)
+                {
+                    int index = _highHead & BufferMask;
+                    action = _highRing[index];
+                    _highRing[index] = null; // Clear reference
+                    _highHead++;
+                }
             }
+
+            if (action == null) break;
+
+            try
+            {
+                action.Invoke();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex, this);
+            }
+            processedCount++;
         }
-        catch (Exception ex)
+
+        // Drain normal-priority actions
+        while (processedCount < MaxBatchPerFrame)
         {
-            Debug.LogException(ex, this);
+            Action action = null;
+            lock (_normalLock)
+            {
+                if (_normalHead != _normalTail)
+                {
+                    int index = _normalHead & BufferMask;
+                    action = _normalRing[index];
+                    _normalRing[index] = null;
+                    _normalHead++;
+                }
+            }
+
+            if (action == null) break;
+
+            try
+            {
+                action.Invoke();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex, this);
+            }
+            processedCount++;
         }
     }
-    private void ReduceBatchSize()
-    {
-        currentBatchSize = Math.Max(currentBatchSize / 2, 50);
-        Debug.LogWarning($"Batch size reduced to {currentBatchSize} due to low memory.");
-    }
+
     private void OnDestroy()
     {
-        Application.lowMemory -= OnLowMemory;
-        actionQueue.Clear();
-        Instance = null;
+        if (Instance == this)
+            Instance = null;
     }
 }
 
-
-
 /// <summary>
-/// Base Observable property class which handles all observable logic
+/// Thread-safe, Zero-Heap Observable Property.
+/// Keeps the Action/lambda design pattern by caching its dispatch delegate upon creation.
 /// </summary>
-/// <typeparam name="T">Generic type</typeparam>
-public class ObservableProperty<T> : IObservable<T>, IDisposable
+/// <typeparam name="T">Property type</typeparam>
+[Serializable]
+public class ObservableProperty<T> : ObservableBase, IObservable<T>, IDisposable
 {
+    private struct SubscriberEntry
+    {
+        public object Observer;
+        public Action<T> Callback;
+    }
+
     [SerializeField]
     private T value;
 
-    [SerializeField]
-    private UnityEvent<T> OnValueChanged = new UnityEvent<T>();
+    private readonly object _lock = new();
 
-    private readonly ConcurrentDictionary<object, Action<T>> subscribers = new();
+    // Pre-allocated Action delegate: satisfies the lambda/Action design with 0 B GC per update!
+    private readonly Action _cachedDispatchAction;
 
-    public ObservableProperty() { }
+    // Pre-allocated array for subscribers (avoids Dictionary IEnumerator allocations)
+    private SubscriberEntry[] _subscribers = new SubscriberEntry[4];
+    private int _subscriberCount;
+    private UnityAction<T> _unityEventCallbacks;
+
+    public ObservableProperty()
+    {
+        value = default;
+        _cachedDispatchAction = DispatchNotifications;
+    }
 
     public ObservableProperty(T initialValue)
     {
         value = initialValue;
+        _cachedDispatchAction = DispatchNotifications;
     }
 
     public T Value
     {
-        get => value;
-        set => SetValue(value);
+        get
+        {
+            lock (_lock)
+            {
+                return value;
+            }
+        }
+        set => SetValue(value, false);
     }
+
     public void SetValue(T newValue, bool forceUpdate = false)
     {
-        if (EqualityComparer<T>.Default.Equals(value, newValue)) return;
+        lock (_lock)
+        {
+            if (EqualityComparer<T>.Default.Equals(value, newValue))
+                return;
 
-        value = newValue;
-        CentralNotificationSystem.Instance.EnqueueMainThreadAction(() => NotifySubscribers(newValue), forceUpdate ? 100 : 0);
+            value = newValue;
+        }
+
+        // Immediate synchronous dispatch if requested and already on the Unity main thread
+        if (forceUpdate && CentralNotificationSystem.IsMainThread)
+        {
+            ClearEnqueued();
+            DispatchNotifications();
+            return;
+        }
+
+        // Zero-GC Action enqueuing: uses the cached Action delegate with the central dispatcher
+        if (TryMarkEnqueued())
+        {
+            var system = CentralNotificationSystem.Instance;
+            if (system != null)
+            {
+                system.EnqueueMainThreadAction(_cachedDispatchAction, forceUpdate ? 100 : 0);
+            }
+            else if (CentralNotificationSystem.IsMainThread)
+            {
+                ClearEnqueued();
+                DispatchNotifications();
+            }
+        }
     }
 
-    private void NotifySubscribers(T newValue)
+    internal override void DispatchNotifications()
     {
-        List<object> invalidSubscribers = new();
+        ClearEnqueued();
 
-        foreach (var subscriber in subscribers)
+        T currentValue;
+        SubscriberEntry[] currentSubs;
+        int count;
+
+        lock (_lock)
         {
+            currentValue = value;
+            currentSubs = _subscribers;
+            count = _subscriberCount;
+        }
+
+        // Direct index iteration without IEnumerator allocations
+        for (int i = 0; i < count; i++)
+        {
+            var entry = currentSubs[i];
+            if (entry.Observer == null) continue;
+
+            if (entry.Observer is UnityEngine.Object unityObj && unityObj == null)
+            {
+                Unsubscribe(entry.Observer);
+                continue;
+            }
+
             try
             {
-                subscriber.Value?.Invoke(newValue);
+                entry.Callback?.Invoke(currentValue);
             }
             catch (Exception e)
             {
-                Debug.LogError($"Exception notifying subscriber: {e}");
-                invalidSubscribers.Add(subscriber.Key);
+                Debug.LogException(e);
+                Unsubscribe(entry.Observer);
             }
         }
 
-        foreach (var invalid in invalidSubscribers)
+        try
         {
-            subscribers.TryRemove(invalid, out _);
+            _unityEventCallbacks?.Invoke(currentValue);
         }
-
-        OnValueChanged?.Invoke(newValue);
+        catch (Exception e)
+        {
+            Debug.LogException(e);
+        }
     }
 
     public void Subscribe(object observer, Action<T> callback)
@@ -286,94 +350,156 @@ public class ObservableProperty<T> : IObservable<T>, IDisposable
         if (observer == null) throw new ArgumentNullException(nameof(observer));
         if (callback == null) throw new ArgumentNullException(nameof(callback));
 
-        if (!subscribers.TryAdd(observer, callback))
+        lock (_lock)
         {
-            Debug.LogWarning($"Observer already subscribed: {observer}");
+            for (int i = 0; i < _subscriberCount; i++)
+            {
+                if (ReferenceEquals(_subscribers[i].Observer, observer))
+                {
+                    _subscribers[i].Callback = callback;
+                    return;
+                }
+            }
+
+            if (_subscriberCount >= _subscribers.Length)
+            {
+                Array.Resize(ref _subscribers, _subscribers.Length * 2);
+            }
+
+            _subscribers[_subscriberCount++] = new SubscriberEntry
+            {
+                Observer = observer,
+                Callback = callback
+            };
         }
+    }
+
+    public IDisposable Subscribe(Action<T> callback)
+    {
+        if (callback == null) throw new ArgumentNullException(nameof(callback));
+        var token = new SubscriptionToken(this, callback);
+        Subscribe(token, callback);
+        return token;
     }
 
     public void Subscribe(UnityAction<T> callback)
     {
         if (callback == null) throw new ArgumentNullException(nameof(callback));
-        OnValueChanged.AddListener(callback);
+        lock (_lock)
+        {
+            _unityEventCallbacks += callback;
+        }
     }
 
     public void Unsubscribe(object observer)
     {
-        if (observer == null) throw new ArgumentNullException(nameof(observer));
-        if (!subscribers.TryRemove(observer, out _))
+        if (observer == null) return;
+
+        lock (_lock)
         {
-            Debug.LogWarning($"Observer not found: {observer}");
+            for (int i = 0; i < _subscriberCount; i++)
+            {
+                if (ReferenceEquals(_subscribers[i].Observer, observer))
+                {
+                    for (int j = i; j < _subscriberCount - 1; j++)
+                    {
+                        _subscribers[j] = _subscribers[j + 1];
+                    }
+                    _subscriberCount--;
+                    _subscribers[_subscriberCount] = default;
+                    return;
+                }
+            }
+        }
+    }
+
+    public void Unsubscribe(UnityAction<T> callback)
+    {
+        if (callback == null) return;
+        lock (_lock)
+        {
+            _unityEventCallbacks -= callback;
         }
     }
 
     public void Dispose()
     {
-        subscribers.Clear();
-        OnValueChanged.RemoveAllListeners();
-    }
-
-    public static bool operator ==(ObservableProperty<T> a, ObservableProperty<T> b)
-    {
-        if (ReferenceEquals(a, b)) return true;
-        if (a is null || b is null) return false;
-        return EqualityComparer<T>.Default.Equals(a.value, b.value);
-    }
-
-    public static bool operator !=(ObservableProperty<T> a, ObservableProperty<T> b) => !(a == b);
-
-    public override bool Equals(object obj)
-    {
-        if (obj is ObservableProperty<T> other)
+        lock (_lock)
         {
-            return EqualityComparer<T>.Default.Equals(value, other.value);
+            Array.Clear(_subscribers, 0, _subscriberCount);
+            _subscriberCount = 0;
+            _unityEventCallbacks = null;
         }
-        return false;
+        ClearEnqueued();
     }
 
-    public override int GetHashCode() => value?.GetHashCode() ?? 0;
+    private sealed class SubscriptionToken : IDisposable
+    {
+        private ObservableProperty<T> _property;
+        private Action<T> _callback;
+
+        public SubscriptionToken(ObservableProperty<T> property, Action<T> callback)
+        {
+            _property = property;
+            _callback = callback;
+        }
+
+        public void Dispose()
+        {
+            if (_property != null)
+            {
+                _property.Unsubscribe(this);
+                _property = null;
+                _callback = null;
+            }
+        }
+    }
 }
 
 #region Base Types
-[System.Serializable]
+[Serializable]
 public class ObservableInt : ObservableProperty<int>
 {
     public ObservableInt() : base() { }
     public ObservableInt(int initialValue) : base(initialValue) { }
 }
 
-[System.Serializable]
+[Serializable]
 public class ObservableBool : ObservableProperty<bool>
 {
     public ObservableBool() : base() { }
     public ObservableBool(bool initialValue) : base(initialValue) { }
 }
 
-[System.Serializable]
+[Serializable]
 public class ObservableFloat : ObservableProperty<float>
 {
     public ObservableFloat() : base() { }
     public ObservableFloat(float initialValue) : base(initialValue) { }
 }
-[System.Serializable]
+
+[Serializable]
 public class ObservableDouble : ObservableProperty<double>
 {
     public ObservableDouble() : base() { }
     public ObservableDouble(double initialValue) : base(initialValue) { }
 }
-[System.Serializable]
+
+[Serializable]
 public class ObservableLong : ObservableProperty<long>
 {
     public ObservableLong() : base() { }
     public ObservableLong(long initialValue) : base(initialValue) { }
 }
-[System.Serializable]
+
+[Serializable]
 public class ObservableString : ObservableProperty<string>
 {
     public ObservableString() : base() { }
     public ObservableString(string initialValue) : base(initialValue) { }
 }
-[System.Serializable]
+
+[Serializable]
 public class ObservableEnum<T> : ObservableProperty<T> where T : Enum
 {
     public ObservableEnum() : base() { }
@@ -382,31 +508,35 @@ public class ObservableEnum<T> : ObservableProperty<T> where T : Enum
 #endregion
 
 #region Unity Specific Types
-[System.Serializable]
+[Serializable]
 public class ObservableVector3 : ObservableProperty<Vector3>
 {
     public ObservableVector3() : base() { }
     public ObservableVector3(Vector3 initialValue) : base(initialValue) { }
 }
-[System.Serializable]
+
+[Serializable]
 public class ObservableVector2 : ObservableProperty<Vector2>
 {
     public ObservableVector2() : base() { }
     public ObservableVector2(Vector2 initialValue) : base(initialValue) { }
 }
-[System.Serializable]
+
+[Serializable]
 public class ObservableVector3Int : ObservableProperty<Vector3Int>
 {
     public ObservableVector3Int() : base() { }
     public ObservableVector3Int(Vector3Int initialValue) : base(initialValue) { }
 }
-[System.Serializable]
+
+[Serializable]
 public class ObservableVector2Int : ObservableProperty<Vector2Int>
 {
     public ObservableVector2Int() : base() { }
     public ObservableVector2Int(Vector2Int initialValue) : base(initialValue) { }
 }
-[System.Serializable]
+
+[Serializable]
 public class ObservableQuaternion : ObservableProperty<Quaternion>
 {
     public ObservableQuaternion() : base() { }
